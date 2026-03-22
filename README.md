@@ -110,7 +110,7 @@ source .venv/bin/activate
 pip install -e .
 
 # Run with:
-sudo .venv/bin/ddtriage /dev/sdb
+sudo .venv/bin/ddtriage
 ```
 
 ## Quick start
@@ -118,10 +118,10 @@ sudo .venv/bin/ddtriage /dev/sdb
 ### Full interactive workflow
 
 ```bash
-sudo ddtriage /dev/sdb
+sudo ddtriage
 ```
 
-This walks you through disk selection, partition selection, MFT recovery, interactive browsing, file selection, targeted recovery, and extraction -- all in one session.
+This guides you through disk selection, partition selection, MFT recovery, interactive browsing, file selection, targeted recovery, and extraction -- all in one session. You can also skip the disk selection by specifying a device directly: `sudo ddtriage /dev/sdb`.
 
 > **Note:** The examples below assume `ddtriage` is on your PATH (pipx install). If using a venv, substitute `sudo .venv/bin/ddtriage` instead.
 
@@ -129,7 +129,7 @@ This walks you through disk selection, partition selection, MFT recovery, intera
 
 ```bash
 # 1. Bootstrap: recover the MFT from the failing drive
-sudo ddtriage bootstrap /dev/sdb
+sudo ddtriage bootstrap
 
 # 2. Browse: interactive file browser (no disk I/O)
 sudo ddtriage browse
@@ -142,13 +142,13 @@ sudo ddtriage recover --selection selection.json --output ./recovered
 
 ```bash
 # With recovery key (48-digit key from Windows setup)
-sudo ddtriage --recovery-key 123456-789012-345678-901234-567890-123456-789012-345678 /dev/sdc
+sudo ddtriage --recovery-key 123456-789012-345678-901234-567890-123456-789012-345678
 
 # With password
-sudo ddtriage --bitlocker-password "mypassword" /dev/sdc
+sudo ddtriage --bitlocker-password "mypassword"
 ```
 
-BitLocker decryption happens transparently via FUSE -- only the sectors you need are decrypted on demand, not the entire volume.
+Provide the credentials upfront and ddtriage will detect the BitLocker partition during disk selection. Decryption happens transparently via FUSE -- only the sectors you need are decrypted on demand, not the entire volume.
 
 ## Commands
 
@@ -245,13 +245,13 @@ For difficult drives, these options are passed through to every ddrescue invocat
 
 ```bash
 # Drive that's failing from the beginning -- read backwards
-sudo ddtriage --reverse /dev/sdb
+sudo ddtriage --reverse
 
 # Very slow drive -- skip slow phases, give up after 60s of no progress
-sudo ddtriage --no-trim --no-scrape --timeout 60 /dev/sdb
+sudo ddtriage --no-trim --no-scrape --timeout 60
 
 # Fine-grained control
-sudo ddtriage --ddrescue-opts="-c 64 -K 100M --pause-on-error=5" /dev/sdb
+sudo ddtriage --ddrescue-opts="-c 64 -K 100M --pause-on-error=5"
 ```
 
 ## TUI browser
@@ -379,7 +379,7 @@ For BitLocker volumes, additional files are created with a `_decrypted` suffix (
 python -m pytest tests/ -v
 
 # Run with verbose logging
-sudo ddtriage -vv /dev/sdb
+sudo ddtriage -vv
 ```
 
 ## License
