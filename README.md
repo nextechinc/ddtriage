@@ -55,9 +55,19 @@ sudo apt install ddrutility
 
 ```bash
 sudo apt install dislocker
+# or as an alternative:
+sudo apt install libbde-utils
 ```
 
-- `dislocker` -- FUSE driver for reading BitLocker-encrypted volumes. Only needed if recovering from an encrypted drive.
+- `dislocker` -- FUSE driver for reading BitLocker-encrypted volumes. ddtriage tries this first.
+- `libbde-utils` -- Alternative BitLocker decryption tool (provides `bdemount`). Used as a fallback if dislocker fails.
+
+> **Note:** Some distros (e.g. Ubuntu 24.04) ship older versions that can't handle newer BitLocker formats from Windows 10/11. If both tools fail, build dislocker from source:
+> ```bash
+> sudo apt install cmake gcc libfuse-dev libmbedtls-dev
+> git clone https://github.com/Aorimn/dislocker.git
+> cd dislocker && cmake . && make && sudo make install
+> ```
 
 ### Python packages
 

@@ -375,7 +375,7 @@ def prompt_bitlocker_credentials() -> tuple[str | None, str | None]:
             print("  Invalid choice.")
 
 
-def mount_dislocker_fuse(
+def mount_bitlocker_fuse(
     device: str,
     mountpoint: Path,
     password: str | None = None,
@@ -383,60 +383,127 @@ def mount_dislocker_fuse(
 ) -> str | None:
     """FUSE-mount a BitLocker-encrypted partition for transparent decryption.
 
-    Returns the path to the decrypted virtual file (mountpoint/dislocker-file),
-    or None on failure. Decryption happens on-demand per read — no full copy.
+    Tries dislocker-fuse first, falls back to bdemount if dislocker fails
+    or isn't installed. Returns the path to the decrypted virtual file,
+    or None on failure.
     """
-    if shutil.which("dislocker-fuse") is None:
-        print("  Error: dislocker is not installed.")
-        print("  Install with: sudo apt install dislocker")
-        return None
-
     mountpoint.mkdir(parents=True, exist_ok=True)
 
-    # dislocker-fuse syntax:
-    #   -r = read-only
-    #   -V <device> = volume to decrypt
-    #   -p<key> = recovery password (no space between -p and key)
-    #   -u<password> = user password (no space between -u and password)
-    #   -- <mountpoint> = FUSE mount point
-    cmd = ["dislocker-fuse", "-r", "-s", "-V", device]  # -s = don't check volume state
+    # Try dislocker-fuse first
+    result = _try_dislocker(device, mountpoint, password, recovery_key)
+    if result is not None:
+        return result
+
+    # Try bdemount as fallback
+    result = _try_bdemount(device, mountpoint, password, recovery_key)
+    if result is not None:
+        return result
+
+    # Both failed — give actionable guidance
+    print()
+    print("  Neither dislocker-fuse nor bdemount could decrypt this volume.")
+    print("  This is usually caused by outdated versions that don't support")
+    print("  newer BitLocker formats (Windows 10/11).")
+    print()
+    print("  To fix, build dislocker from source:")
+    print("    sudo apt install cmake gcc libfuse-dev libmbedtls-dev")
+    print("    git clone https://github.com/Aorimn/dislocker.git")
+    print("    cd dislocker && cmake . && make && sudo make install")
+    print()
+    return None
+
+
+def _try_dislocker(
+    device: str,
+    mountpoint: Path,
+    password: str | None,
+    recovery_key: str | None,
+) -> str | None:
+    """Try mounting with dislocker-fuse. Returns decrypted file path or None."""
+    if shutil.which("dislocker-fuse") is None:
+        log.info("dislocker-fuse not found, skipping")
+        return None
+
+    cmd = ["dislocker-fuse", "-r", "-s", "-V", device]
 
     if recovery_key:
         cmd.append(f"-p{recovery_key}")
     elif password:
         cmd.append(f"-u{password}")
     else:
-        print("  Error: no password or recovery key provided.")
         return None
 
     cmd.extend(["--", str(mountpoint)])
 
     log.info("Running: %s", " ".join(cmd))
-    print("  Mounting BitLocker volume via FUSE...")
+    print("  Trying dislocker-fuse...")
 
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     if result.returncode != 0:
-        # Combine stdout and stderr — dislocker sometimes outputs errors to stdout
         output = (result.stdout + "\n" + result.stderr).strip()
         log.error("dislocker-fuse failed (exit %d): %s", result.returncode, output)
         if "password" in output.lower() or "key" in output.lower():
             print("  Error: incorrect password or recovery key.")
-        else:
-            print(f"  Error: dislocker-fuse failed: {output or '(no output)'}")
+            return None  # Don't try bdemount — credentials are wrong
+        print(f"  dislocker-fuse failed: {output or '(unknown error)'}")
         return None
 
     fuse_file = mountpoint / "dislocker-file"
     if not fuse_file.exists():
-        print(f"  Error: FUSE mount succeeded but {fuse_file} not found.")
-        unmount_dislocker_fuse(mountpoint)
+        unmount_bitlocker_fuse(mountpoint)
         return None
 
-    print("  BitLocker FUSE mount active.")
+    print("  BitLocker FUSE mount active (dislocker).")
     return str(fuse_file)
 
 
-def unmount_dislocker_fuse(mountpoint: Path) -> None:
-    """Unmount a dislocker FUSE mount."""
+def _try_bdemount(
+    device: str,
+    mountpoint: Path,
+    password: str | None,
+    recovery_key: str | None,
+) -> str | None:
+    """Try mounting with bdemount (libbde). Returns decrypted file path or None."""
+    if shutil.which("bdemount") is None:
+        log.info("bdemount not found, skipping")
+        return None
+
+    cmd = ["bdemount"]
+
+    if recovery_key:
+        cmd.extend(["-r", recovery_key])
+    elif password:
+        cmd.extend(["-p", password])
+    else:
+        return None
+
+    cmd.extend([device, str(mountpoint)])
+
+    log.info("Running: %s", " ".join(cmd))
+    print("  Trying bdemount...")
+
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    if result.returncode != 0:
+        output = (result.stdout + "\n" + result.stderr).strip()
+        log.error("bdemount failed (exit %d): %s", result.returncode, output)
+        if "password" in output.lower() or "key" in output.lower():
+            print("  Error: incorrect password or recovery key.")
+        else:
+            print(f"  bdemount failed: {output or '(unknown error)'}")
+        return None
+
+    # bdemount exposes the volume as bde1
+    bde_file = mountpoint / "bde1"
+    if not bde_file.exists():
+        unmount_bitlocker_fuse(mountpoint)
+        return None
+
+    print("  BitLocker FUSE mount active (bdemount).")
+    return str(bde_file)
+
+
+def unmount_bitlocker_fuse(mountpoint: Path) -> None:
+    """Unmount a BitLocker FUSE mount (dislocker or bdemount)."""
     try:
         subprocess.run(["fusermount", "-u", str(mountpoint)],
                        capture_output=True, timeout=10)
@@ -587,7 +654,7 @@ def run_bootstrap(
             return state
 
         fuse_mountpoint = work_dir / "_dislocker_fuse"
-        fuse_file = mount_dislocker_fuse(
+        fuse_file = mount_bitlocker_fuse(
             partition.path, fuse_mountpoint, password=pw, recovery_key=rk,
         )
         if fuse_file is None:
@@ -669,7 +736,7 @@ def run_bootstrap(
 
     # Unmount FUSE if it was used
     if fuse_mountpoint:
-        unmount_dislocker_fuse(fuse_mountpoint)
+        unmount_bitlocker_fuse(fuse_mountpoint)
 
     # Step 4: Parse boot sector from image
     img_to_parse = Path(state.image)

@@ -688,7 +688,7 @@ def _do_recover(
     bitlocker_recovery_key: str | None = None,
 ) -> int:
     """Run recovery (gddrescue) then extraction."""
-    from .bootstrap import mount_dislocker_fuse, unmount_dislocker_fuse
+    from .bootstrap import mount_bitlocker_fuse, unmount_bitlocker_fuse
 
     mapfile = None
     mf_path = Path(state.mapfile)
@@ -711,7 +711,7 @@ def _do_recover(
                 return 1
 
             fuse_mountpoint = work_dir / "_dislocker_fuse"
-            fuse_file = mount_dislocker_fuse(
+            fuse_file = mount_bitlocker_fuse(
                 state.bitlocker_partition, fuse_mountpoint,
                 password=pw, recovery_key=rk,
             )
@@ -758,7 +758,7 @@ def _do_recover(
                     print_results(results)
         finally:
             if fuse_mountpoint:
-                unmount_dislocker_fuse(fuse_mountpoint)
+                unmount_bitlocker_fuse(fuse_mountpoint)
 
     # Extract files
     if not dry_run:
