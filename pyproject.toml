@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ddtriage"
+version = "0.1.0"
+description = "NTFS-aware selective data recovery tool"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = [
+    "textual>=0.40.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
+
+[project.scripts]
+ddtriage = "ddtriage.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["ddtriage*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

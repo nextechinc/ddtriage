@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+.venv/
+
+# ddtriage runtime artifacts
+*.img
+*.log
+*_domain.log
+ddtriage_state.json
+selection.json
+recovered/
+*-recovered/
+
+# ddrutility intermediate files
+__bitmapfile
+__bootsec
+__mftshort
+__bootsec.log
+__mftshort.log
+ntfsbitmap_rescue_report.log
+_part0__bitmapfile.log
+
+# FUSE mounts
+_dislocker_fuse/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# pytest
+.pytest_cache/
