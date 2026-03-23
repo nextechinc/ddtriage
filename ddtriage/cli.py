@@ -13,6 +13,7 @@ log = logging.getLogger(__name__)
 from .bootstrap import (
     SessionState, check_dependencies, list_disks, partition_basename,
     select_disk_interactive, select_partition_interactive, run_bootstrap,
+    find_session_files, cleanup_session_files,
 )
 from .mapfile.parser import parse_mapfile_from_path
 from .ntfs.boot_sector import parse_boot_sector
@@ -450,6 +451,29 @@ def cmd_interactive(args, work_dir: Path) -> int:
             return 0
         if resume == 'n':
             state = None
+
+    # If starting fresh, check for stale files from a previous session
+    if state is None or not state.bootstrap_complete:
+        stale = find_session_files(work_dir)
+        if stale:
+            print(f"\n  Previous session files found ({len(stale)}):")
+            for p in stale[:10]:
+                print(f"    {p.name}")
+            if len(stale) > 10:
+                print(f"    ... and {len(stale) - 10} more")
+            print()
+            try:
+                cleanup = input("  Delete previous session files? [Y/n]: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return 0
+            if cleanup != 'n':
+                removed = cleanup_session_files(work_dir)
+                print(f"  Removed {removed} files.")
+            else:
+                print("  Warning: Stale files may cause errors. Consider using")
+                print("  --output-dir to point to a different directory.")
+            print()
 
     # Phase 1: Bootstrap
     if state is None or not state.bootstrap_complete:

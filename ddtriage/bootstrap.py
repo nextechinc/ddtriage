@@ -18,6 +18,18 @@ log = logging.getLogger(__name__)
 
 STATE_FILENAME = "ddtriage_state.json"
 
+# Files/patterns created during a recovery session
+_SESSION_FILES = [
+    "_bootsec_domain.log", "_bootsec_decrypted_domain.log",
+    "_backup_bs_domain.log", "recovery_domain.log",
+    "selection.json", STATE_FILENAME,
+    # ddrutility intermediates
+    "__bitmapfile", "__bootsec", "__mftshort",
+    "__bootsec.log", "__mftshort.log",
+    "ntfsbitmap_rescue_report.log", "_part0__bitmapfile.log",
+]
+_SESSION_DIRS = ["_dislocker_fuse"]
+
 
 # ---------------------------------------------------------------------------
 # Data types
@@ -98,6 +110,53 @@ def partition_basename(path: str) -> str:
     Examples: /dev/sdc3 → sdc3, /dev/nvme0n1p2 → nvme0n1p2, /dev/sdb → sdb
     """
     return Path(path).name
+
+
+def find_session_files(work_dir: Path) -> list[Path]:
+    """Find all recovery session files in the working directory."""
+    found: list[Path] = []
+
+    # Fixed-name files
+    for name in _SESSION_FILES:
+        p = work_dir / name
+        if p.exists():
+            found.append(p)
+
+    # Partition-named files (*.img, *.log, *_decrypted.*, *_domain.log, etc.)
+    for p in work_dir.iterdir():
+        if p.is_file() and p.suffix in ('.img', '.log') and p.name not in _SESSION_FILES:
+            found.append(p)
+
+    # Directories
+    for name in _SESSION_DIRS:
+        p = work_dir / name
+        if p.exists() and p.is_dir():
+            found.append(p)
+
+    # Recovery output dirs (*-recovered/)
+    for p in work_dir.iterdir():
+        if p.is_dir() and p.name.endswith('-recovered'):
+            found.append(p)
+
+    return sorted(found)
+
+
+def cleanup_session_files(work_dir: Path) -> int:
+    """Delete all recovery session files from the working directory.
+
+    Returns the number of files/directories removed.
+    """
+    removed = 0
+    for p in find_session_files(work_dir):
+        try:
+            if p.is_dir():
+                shutil.rmtree(p)
+            else:
+                p.unlink()
+            removed += 1
+        except OSError as e:
+            log.warning("Could not remove %s: %s", p, e)
+    return removed
 
 
 def _human_size(nbytes: int) -> str:
@@ -632,13 +691,16 @@ def run_bootstrap(
         f.write(f"0x{offset:08X}  0x{512:08X}  +\n")
     cmd = ["ddrescue", "-d", "-m", str(bs_domain)] + extra + [
            disk_device, str(image_path), str(mapfile_path)]
-    _run(cmd, "Recovering boot sector")
+    result = _run(cmd, "Recovering boot sector")
 
     # Step 1b: Check for BitLocker — if encrypted, FUSE-mount for transparent
     # decryption so all subsequent reads go through the decrypted view
     fuse_mountpoint = None
     source_device = disk_device       # what ddrescue reads from
     source_offset = partition.start_bytes  # partition offset for ddru_ntfsbitmap
+
+    if result.returncode != 0:
+        log.warning("Boot sector recovery failed (exit %d)", result.returncode)
 
     if image_path.exists() and check_bitlocker(image_path, partition.start_bytes):
         state.bitlocker = True
@@ -718,7 +780,17 @@ def run_bootstrap(
             print("  This is normal for failing drives — retrying bad sectors...")
             retry = max(retry, 1)
     else:
-        _bootstrap_manual(partition, source_device, work_dir, state, ddrescue_extra=extra)
+        try:
+            _bootstrap_manual(partition, source_device, work_dir, state, ddrescue_extra=extra)
+        except BitLockerDetected:
+            print("  Error: This volume is BitLocker-encrypted.")
+            print("  Re-run with --recovery-key or --bitlocker-password to decrypt.")
+            state.save(work_dir)
+            return state
+        except RuntimeError as e:
+            print(f"  Error: {e}")
+            state.save(work_dir)
+            return state
         if mft_domain_path.exists():
             mft_domain_used = mft_domain_path
 
@@ -805,9 +877,17 @@ def _bootstrap_manual(
 
     try:
         bs = parse_boot_sector(bs_data)
-    except ValueError:
+    except BitLockerDetected:
+        raise  # Let caller handle BitLocker detection
+    except ValueError as primary_err:
         # Try backup boot sector (last sector of partition)
-        print("  Primary boot sector damaged, trying backup...")
+        if partition.size_bytes <= 512:
+            raise RuntimeError(
+                f"Primary boot sector unreadable ({primary_err}) and partition "
+                f"size unknown — cannot locate backup boot sector."
+            )
+
+        print(f"  Primary boot sector unreadable ({primary_err}), trying backup...")
         backup_offset = offset + partition.size_bytes - 512
         backup_domain = work_dir / "_backup_bs_domain.log"
         with open(backup_domain, 'w') as f:
@@ -824,6 +904,13 @@ def _bootstrap_manual(
         with open(image_path, 'rb') as f:
             f.seek(backup_offset)
             bs_data = f.read(512)
+
+        if len(bs_data) < 512:
+            raise RuntimeError(
+                f"Backup boot sector read returned {len(bs_data)} bytes "
+                f"(expected 512) at offset 0x{backup_offset:X}."
+            )
+
         bs = parse_boot_sector(bs_data)
 
     # Calculate MFT location and create domain log
