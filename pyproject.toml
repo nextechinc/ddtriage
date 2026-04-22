@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ddtriage"
 version = "0.1.0"
-description = "NTFS-aware selective data recovery tool"
+description = "Selective data recovery tool for NTFS, FAT32, and other filesystems"
 license = "MIT"
 requires-python = ">=3.10"
 dependencies = [

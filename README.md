@@ -1,6 +1,6 @@
 # ddtriage
 
-NTFS-aware selective data recovery tool for Linux. Recover specific files and folders from failing or BitLocker-encrypted NTFS drives without imaging the entire disk.
+Selective data recovery tool for Linux. Recover specific files and folders from failing drives without imaging the entire disk. Supports NTFS (including BitLocker-encrypted), FAT32, FAT16, and FAT12 filesystems, with ext4 and exFAT support planned.
 
 > **Disclaimer:** This software is provided as-is, with no warranty of any kind. Data recovery is inherently risky -- there is no guarantee that any data can or will be recovered. The authors are not responsible for any data loss, damage, or other consequences resulting from the use or misuse of this tool. **Use at your own risk.** Always work from a copy or image when possible, and never write to a failing drive.
 
@@ -26,6 +26,7 @@ The key principle: **the failing drive is never read twice for the same sector.*
 - **Progressive imaging** -- All disk reads are cached; subsequent operations reuse existing data
 - **Health indicators** -- Per-file coverage status shows what's already in the image vs. what still needs to be read
 - **MFT coverage reporting** -- Shows what percentage of the file table was recovered, so you know if the listing is incomplete
+- **Multi-filesystem** -- NTFS, FAT32, FAT16, FAT12 (ext4 and exFAT planned)
 - **Compressed file support** -- Handles NTFS LZNT1 compression
 - **Resilient parsing** -- Gracefully handles damaged MFT records, corrupt attributes, and partial data
 - **ddrescue tuning** -- Expose advanced ddrescue options for difficult drives (reverse, no-trim, timeout, etc.)

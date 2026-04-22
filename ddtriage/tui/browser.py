@@ -498,7 +498,7 @@ class RecoveryBrowser(App):
                     parent.expand()
                     parent = parent.parent
                 tree.select_node(node)
-                node.scroll_visible()
+                tree.scroll_to_node(node)
                 self.action_cancel_search()
                 return
 

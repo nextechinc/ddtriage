@@ -81,7 +81,7 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = argparse.ArgumentParser(
         prog="ddtriage",
-        description="NTFS-aware selective data recovery tool",
+        description="Selective data recovery tool",
         parents=[parent],
     )
 
@@ -237,7 +237,7 @@ def cmd_bootstrap(args, work_dir: Path) -> int:
 
 def cmd_scan(args, work_dir: Path) -> int:
     state = _load_state_or_args(args, work_dir)
-    tree = _parse_mft(state)
+    tree = _parse_filesystem(state)
     if tree is None:
         return 1
 
@@ -256,7 +256,7 @@ def cmd_scan(args, work_dir: Path) -> int:
 def cmd_browse(args, work_dir: Path) -> int:
     state = _load_state_or_args(args, work_dir)
     include_deleted = getattr(args, 'show_deleted', False)
-    tree = _parse_mft(state, include_deleted=include_deleted)
+    tree = _parse_filesystem(state, include_deleted=include_deleted)
     if tree is None:
         return 1
 
@@ -311,7 +311,7 @@ def cmd_recover(args, work_dir: Path) -> int:
         state.device = args.device
 
     selected = import_selection(args.selection)
-    tree = _parse_mft(state)
+    tree = _parse_filesystem(state)
     if tree is None:
         return 1
 
@@ -330,7 +330,7 @@ def cmd_recover(args, work_dir: Path) -> int:
 def cmd_extract(args, work_dir: Path) -> int:
     state = _load_state_or_args(args, work_dir)
     selected = import_selection(args.selection)
-    tree = _parse_mft(state)
+    tree = _parse_filesystem(state)
     if tree is None:
         return 1
 
@@ -413,7 +413,7 @@ def cmd_status(args, work_dir: Path) -> int:
 
 def cmd_tree(args, work_dir: Path) -> int:
     state = _load_state_or_args(args, work_dir)
-    tree = _parse_mft(state,
+    tree = _parse_filesystem(state,
                       include_deleted=getattr(args, 'show_deleted', False),
                       include_system=getattr(args, 'show_system', False))
     if tree is None:
@@ -438,7 +438,7 @@ def cmd_tree(args, work_dir: Path) -> int:
 
 def cmd_interactive(args, work_dir: Path) -> int:
     """Full interactive workflow: bootstrap → scan → browse → recover → extract."""
-    print("\n  ddtriage — NTFS-aware selective data recovery\n")
+    print("\n  ddtriage — selective data recovery\n")
 
     # Check for existing state
     state = SessionState.load(work_dir)
@@ -538,8 +538,8 @@ def cmd_interactive(args, work_dir: Path) -> int:
         return 1
 
     # Phase 2: Parse MFT
-    print("\n  Parsing MFT...")
-    tree = _parse_mft(state)
+    print("\n  Parsing filesystem...")
+    tree = _parse_filesystem(state)
     if tree is None:
         print("  Error: Could not parse MFT from image.")
         return 1
@@ -610,19 +610,90 @@ def _load_state_or_args(args, work_dir: Path) -> SessionState:
     return state
 
 
-def _parse_mft(state: SessionState, include_deleted: bool = False, include_system: bool = False):
-    """Parse MFT from image and build directory tree. Returns DirectoryTree or None."""
+def _parse_filesystem(state: SessionState, include_deleted: bool = False, include_system: bool = False):
+    """Parse filesystem from image and build directory tree.
+
+    Detects the filesystem type (NTFS, FAT32, etc.) and uses the
+    appropriate parser. Returns DirectoryTree or None.
+    """
     image = Path(state.image)
     if not image.exists():
         print(f"  Error: Image not found at {image}")
         return None
 
     offset = state.partition_offset
+
+    # Detect filesystem type
+    from .fs import detect_filesystem, get_parser
+    from .ntfs.boot_sector import BitLockerDetected
+
+    log.info("Reading filesystem header from %s at offset 0x%X", image, offset)
+    try:
+        with open(image, 'rb') as f:
+            f.seek(offset)
+            header_data = f.read(4096)
+    except OSError as e:
+        print(f"  Error reading image: {e}")
+        return None
+
+    fs_type = detect_filesystem(header_data)
+    if fs_type == 'bitlocker':
+        print(f"  Error: {image} is BitLocker-encrypted.")
+        print(f"  Hint: re-run bootstrap with --recovery-key to create a decrypted image.")
+        return None
+    elif fs_type is None:
+        # Try NTFS fallback using saved state
+        if state.mft_start_lcn:
+            fs_type = 'ntfs'
+            print(f"  Warning: filesystem type not detected, assuming NTFS from saved state.")
+        else:
+            print(f"  Error: unrecognized filesystem at offset 0x{offset:X}.")
+            print(f"  Hint: re-run bootstrap to recover the boot sector.")
+            return None
+
+    log.info("Detected filesystem: %s", fs_type)
+
+    # For NTFS, use the existing optimized path with progress bar
+    if fs_type == 'ntfs':
+        return _parse_ntfs(state, include_deleted, include_system)
+
+    # For other filesystems, use the generic parser
+    try:
+        parser = get_parser(fs_type)
+    except ValueError as e:
+        print(f"  Error: {e}")
+        return None
+
+    from .progress import mft_progress
+    try:
+        with open(image, 'rb') as f:
+            mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+            try:
+                with mft_progress(None) as update:
+                    def _cb(idx, rec):
+                        update(1)
+                    tree = parser.parse(
+                        mm, offset,
+                        progress_callback=_cb,
+                        include_deleted=include_deleted,
+                    )
+            finally:
+                mm.close()
+    except Exception as e:
+        print(f"  Error parsing {fs_type} filesystem: {e}")
+        return None
+
+    state.cluster_size = parser.get_cluster_size()
+    return tree
+
+
+def _parse_ntfs(state: SessionState, include_deleted: bool = False, include_system: bool = False):
+    """Parse NTFS filesystem using the optimized NTFS-specific path."""
+    image = Path(state.image)
+    offset = state.partition_offset
     cluster_size = state.cluster_size or 4096
     record_size = state.mft_record_size or 1024
 
-    from .ntfs.boot_sector import BitLockerDetected
-    log.info("Reading boot sector from %s at offset 0x%X", image, offset)
     try:
         with open(image, 'rb') as f:
             f.seek(offset)
@@ -635,10 +706,6 @@ def _parse_mft(state: SessionState, include_deleted: bool = False, include_syste
         mft_offset = bs.mft_offset(offset)
         log.info("Boot sector: cluster_size=%d, mft_lcn=%d, mft_offset=0x%X",
                  cluster_size, bs.mft_start_lcn, mft_offset)
-    except BitLockerDetected:
-        print(f"  Error: {image} is BitLocker-encrypted.")
-        print(f"  Hint: re-run bootstrap with --recovery-key to create a decrypted image.")
-        return None
     except (ValueError, OSError) as e:
         if state.mft_start_lcn:
             mft_offset = state.mft_start_lcn * cluster_size + offset
@@ -646,24 +713,17 @@ def _parse_mft(state: SessionState, include_deleted: bool = False, include_syste
                   f"(MFT at 0x{mft_offset:X})")
         else:
             print(f"  Error: boot sector unreadable and no saved MFT location: {e}")
-            print(f"  Hint: re-run bootstrap to recover the boot sector.")
             return None
 
-    # Memory-map the image for efficient MFT parsing
     from .progress import mft_progress
-    # Estimate MFT record count from the MFT domain log if available,
-    # otherwise fall back to a rough guess. Don't use file_size — for large
-    # images it vastly overestimates (e.g. 18M vs 159K actual records).
     max_possible = None
     if state.mft_coverage_pct > 0 and state.total_mft_entries > 0:
         max_possible = state.total_mft_entries
     else:
-        # Check for MFT domain log to estimate size
         basename = partition_basename(state.partition) if state.partition else ""
         domain_path = Path(state.image).parent / f"{basename}_mft_domain.log"
         if domain_path.exists():
             try:
-                from .mapfile.parser import parse_mapfile_from_path
                 domain = parse_mapfile_from_path(str(domain_path))
                 mft_bytes = sum(e.size for e in domain.entries if e.status == '+')
                 max_possible = mft_bytes // record_size
@@ -682,7 +742,6 @@ def _parse_mft(state: SessionState, include_deleted: bool = False, include_syste
             finally:
                 mm.close()
     except (OSError, ValueError) as e:
-        # Fallback: read the MFT region into memory
         try:
             with open(image, 'rb') as f:
                 f.seek(0)
@@ -692,7 +751,6 @@ def _parse_mft(state: SessionState, include_deleted: bool = False, include_syste
             print(f"  Error reading MFT: {e2}")
             return None
 
-    # Save actual record count for future progress bar accuracy
     if records:
         state.total_mft_entries = max(r.index for r in records) + 1
 

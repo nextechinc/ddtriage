@@ -318,7 +318,6 @@ def select_disk_interactive(disks: list[DiskInfo]) -> DiskInfo | None:
 
 def select_partition_interactive(disk: DiskInfo) -> PartitionInfo | None:
     """Present partition list for a disk and let user choose."""
-    ntfs_parts = [p for p in disk.partitions if p.fs_type.lower() == "ntfs"]
     all_parts = disk.partitions
 
     if not all_parts:
@@ -329,12 +328,17 @@ def select_partition_interactive(disk: DiskInfo) -> PartitionInfo | None:
     print(f"\n  Partitions on {disk.path}:\n")
     for i, p in enumerate(all_parts, 1):
         label = f'  "{p.label}"' if p.label else ""
-        ntfs_marker = " ← NTFS" if p.fs_type.lower() == "ntfs" else ""
-        print(f"    {i})  {p.path}  —  {p.fs_type:<8} {p.size_human}{label}{ntfs_marker}")
+        supported = ("ntfs", "bitlocker", "fat32", "fat16", "fat12", "vfat",
+                     "exfat", "ext4", "ext3", "ext2")
+        marker = f" ← {p.fs_type.upper()}" if p.fs_type.lower() in supported else ""
+        print(f"    {i})  {p.path}  —  {p.fs_type:<8} {p.size_human}{label}{marker}")
     print()
 
-    if not ntfs_parts:
-        print("  Warning: no NTFS partitions detected on this disk.")
+    supported = ("ntfs", "bitlocker", "fat32", "fat16", "fat12", "vfat",
+                 "exfat", "ext4", "ext3", "ext2")
+    supported_parts = [p for p in all_parts if p.fs_type.lower() in supported]
+    if not supported_parts:
+        print("  Warning: no supported partitions detected on this disk.")
 
     while True:
         try:
@@ -348,10 +352,12 @@ def select_partition_interactive(disk: DiskInfo) -> PartitionInfo | None:
             idx = int(choice) - 1
             if 0 <= idx < len(all_parts):
                 selected = all_parts[idx]
-                if selected.fs_type.lower() not in ("ntfs", "bitlocker"):
+                supported_types = ("ntfs", "bitlocker", "fat32", "fat16", "fat12",
+                                   "vfat", "exfat", "ext4", "ext3", "ext2")
+                if selected.fs_type.lower() not in supported_types:
                     try:
                         confirm = input(
-                            f"  {selected.path} is {selected.fs_type}, not NTFS. "
+                            f"  {selected.path} is {selected.fs_type}, which may not be supported. "
                             "Continue anyway? [y/N]: "
                         ).strip().lower()
                     except (EOFError, KeyboardInterrupt):
@@ -682,13 +688,14 @@ def run_bootstrap(
         phase="bootstrap",
     )
 
-    # Step 1: Recover boot sector to detect BitLocker vs plain NTFS
+    # Step 1: Recover the first 4KB of the partition — enough to cover
+    # NTFS/FAT boot sectors (offset 0) AND the ext4 superblock (offset 1024).
     offset = partition.start_bytes
     bs_domain = work_dir / "_bootsec_domain.log"
     with open(bs_domain, 'w') as f:
         f.write("# Boot sector domain\n")
         f.write("0x00000000  ?\n")
-        f.write(f"0x{offset:08X}  0x{512:08X}  +\n")
+        f.write(f"0x{offset:08X}  0x{4096:08X}  +\n")
     cmd = ["ddrescue", "-d", "-m", str(bs_domain)] + extra + [
            disk_device, str(image_path), str(mapfile_path)]
     result = _run(cmd, "Recovering boot sector")
@@ -747,64 +754,94 @@ def run_bootstrap(
                source_device, str(image_path), str(mapfile_path)]
         _run(cmd, "Recovering decrypted boot sector")
 
-    # Step 2: Run ddru_ntfsbitmap
+    # Detect filesystem type from the recovered boot sector
+    from .fs import detect_filesystem as _detect_fs
+    detected_fs = None
+    try:
+        with open(image_path, 'rb') as f:
+            f.seek(state.partition_offset)
+            hdr = f.read(4096)
+        detected_fs = _detect_fs(hdr)
+        if detected_fs:
+            log.info("Detected filesystem: %s", detected_fs)
+    except OSError:
+        pass
+
+    # Step 2: For NTFS, run ddru_ntfsbitmap to find MFT.
+    # For other filesystems, recover the filesystem metadata region.
     ddru_ok = False
-    if not skip_ddru and shutil.which("ddru_ntfsbitmap"):
-        cmd = [
-            "ddru_ntfsbitmap",
-            "--mftdomain", str(mft_domain_path),
-        ]
-        if source_offset > 0:
-            cmd.extend(["-i", str(source_offset)])
-        cmd.extend([source_device, str(used_domain_path)])
+    if detected_fs in ('ntfs', 'bitlocker', None):
+        # NTFS path: use ddru_ntfsbitmap if available
+        if not skip_ddru and shutil.which("ddru_ntfsbitmap"):
+            cmd = [
+                "ddru_ntfsbitmap",
+                "--mftdomain", str(mft_domain_path),
+            ]
+            if source_offset > 0:
+                cmd.extend(["-i", str(source_offset)])
+            cmd.extend([source_device, str(used_domain_path)])
 
-        result = _run(cmd, "Analyzing NTFS structure with ddru_ntfsbitmap")
-        ddru_ok = result.returncode == 0
-        if not ddru_ok:
-            print("  ddru_ntfsbitmap failed; falling back to manual bootstrap.")
-    else:
-        if not skip_ddru:
-            print("  ddru_ntfsbitmap not found; falling back to manual bootstrap.")
+            result = _run(cmd, "Analyzing NTFS structure with ddru_ntfsbitmap")
+            ddru_ok = result.returncode == 0
+            if not ddru_ok:
+                print("  ddru_ntfsbitmap failed; falling back to manual bootstrap.")
+        else:
+            if not skip_ddru:
+                print("  ddru_ntfsbitmap not found; falling back to manual bootstrap.")
+    elif detected_fs in ('fat32', 'fat16', 'fat12'):
+        # FAT path: recover boot sector + FAT table + root directory
+        print(f"  {detected_fs.upper()} filesystem detected.")
+        _bootstrap_fat(partition, source_device, work_dir, state, extra)
+        ddru_ok = True  # skip NTFS MFT recovery path
+    elif detected_fs in ('ext4', 'ext3', 'ext2'):
+        print(f"  {detected_fs} filesystem detected.")
+        _bootstrap_ext4(partition, source_device, work_dir, state, extra)
+        ddru_ok = True
+    elif detected_fs == 'exfat':
+        print("  exFAT filesystem detected.")
+        _bootstrap_fat(partition, source_device, work_dir, state, extra)
+        ddru_ok = True
 
-    # Step 3: Recover MFT via gddrescue
+    # Step 3: Recover MFT (NTFS only — other filesystems already handled above)
     mft_domain_used = None
-    if ddru_ok and mft_domain_path.exists():
-        mft_domain_used = mft_domain_path
-        cmd = ["ddrescue", "-d", "-m", str(mft_domain_path)] + extra + [
-               source_device, str(image_path), str(mapfile_path)]
-        result = _run(cmd, "Recovering MFT region")
-        if result.returncode != 0:
-            log.warning("gddrescue first pass returned exit code %d (partial recovery)",
-                        result.returncode)
-            print(f"  Warning: gddrescue first pass had errors (exit {result.returncode}).")
-            print("  This is normal for failing drives — retrying bad sectors...")
-            retry = max(retry, 1)
-    else:
-        try:
-            _bootstrap_manual(partition, source_device, work_dir, state, ddrescue_extra=extra)
-        except BitLockerDetected:
-            print("  Error: This volume is BitLocker-encrypted.")
-            print("  Re-run with --recovery-key or --bitlocker-password to decrypt.")
-            state.save(work_dir)
-            return state
-        except RuntimeError as e:
-            print(f"  Error: {e}")
-            state.save(work_dir)
-            return state
-        if mft_domain_path.exists():
+    if detected_fs in ('ntfs', 'bitlocker', None):
+        if ddru_ok and mft_domain_path.exists():
             mft_domain_used = mft_domain_path
+            cmd = ["ddrescue", "-d", "-m", str(mft_domain_path)] + extra + [
+                   source_device, str(image_path), str(mapfile_path)]
+            result = _run(cmd, "Recovering MFT region")
+            if result.returncode != 0:
+                log.warning("gddrescue first pass returned exit code %d (partial recovery)",
+                            result.returncode)
+                print(f"  Warning: gddrescue first pass had errors (exit {result.returncode}).")
+                print("  This is normal for failing drives — retrying bad sectors...")
+                retry = max(retry, 1)
+        else:
+            try:
+                _bootstrap_manual(partition, source_device, work_dir, state, ddrescue_extra=extra)
+            except BitLockerDetected:
+                print("  Error: This volume is BitLocker-encrypted.")
+                print("  Re-run with --recovery-key or --bitlocker-password to decrypt.")
+                state.save(work_dir)
+                return state
+            except RuntimeError as e:
+                print(f"  Error: {e}")
+                state.save(work_dir)
+                return state
+            if mft_domain_path.exists():
+                mft_domain_used = mft_domain_path
 
-    # Step 3b: Retry pass (always at least 1 if first pass had errors)
-    if retry > 0:
-        domain_flag = ["-m", str(mft_domain_used)] if mft_domain_used else []
-        cmd = ["ddrescue", "-d", f"-r{retry}"] + domain_flag + extra + [
-            source_device, str(image_path), str(mapfile_path)]
-        _run(cmd, f"Retry pass ({retry} retries)")
+        # Retry pass (always at least 1 if first pass had errors)
+        if retry > 0:
+            domain_flag = ["-m", str(mft_domain_used)] if mft_domain_used else []
+            cmd = ["ddrescue", "-d", f"-r{retry}"] + domain_flag + extra + [
+                source_device, str(image_path), str(mapfile_path)]
+            _run(cmd, f"Retry pass ({retry} retries)")
 
-    # Step 3c: Compute MFT coverage percentage
-    state.mft_coverage_pct = _compute_mft_coverage(
-        mapfile_path, mft_domain_used,
-    )
+        # Compute MFT coverage percentage
+        state.mft_coverage_pct = _compute_mft_coverage(
+            mapfile_path, mft_domain_used,
+        )
 
     # Unmount FUSE if it was used
     if fuse_mountpoint:
@@ -838,6 +875,470 @@ def run_bootstrap(
     print("  Bootstrap complete.")
 
     return state
+
+
+def _bootstrap_fat(
+    partition: PartitionInfo,
+    source_device: str,
+    work_dir: Path,
+    state: SessionState,
+    extra: list[str],
+) -> None:
+    """Bootstrap a FAT or exFAT filesystem by recovering boot sector, FAT, and root dir."""
+    image_path = Path(state.image)
+    mapfile_path = Path(state.mapfile)
+    offset = state.partition_offset
+
+    # Detect whether this is FAT32 or exFAT and parse accordingly
+    from .fs import detect_filesystem as _detect_fs
+    with open(image_path, 'rb') as f:
+        f.seek(offset)
+        bs_data = f.read(512)
+
+    detected = _detect_fs(bs_data)
+
+    if detected == 'exfat':
+        from .exfat.boot_sector import parse_exfat_boot_sector
+        bs = parse_exfat_boot_sector(bs_data)
+        state.cluster_size = bs.cluster_size
+        fat_start = offset + bs.fat_byte_offset
+        fat_size = bs.num_fats * bs.fat_length * bs.bytes_per_sector
+        data_start = offset + bs.heap_byte_offset
+        total_bytes = bs.volume_length * bs.bytes_per_sector
+    else:
+        from .fat32.boot_sector import parse_fat_boot_sector
+        bs = parse_fat_boot_sector(bs_data)
+        state.cluster_size = bs.cluster_size
+        fat_start = offset + bs.fat_start
+        fat_size = bs.num_fats * bs.fat_size * bs.bytes_per_sector
+        data_start = offset + bs.data_start
+        total_bytes = bs.total_sectors * bs.bytes_per_sector
+
+    # Step 1: Recover boot sector + FAT table + root directory cluster
+    # We need the root dir in the image so step 2 can read it and
+    # recursively find all subdirectory clusters.
+    if detected == 'exfat':
+        root_cluster_offset = data_start + (bs.root_cluster - 2) * state.cluster_size
+    else:
+        root_cluster_offset = data_start  # root cluster is at data_start for FAT32
+        if hasattr(bs, 'root_cluster') and bs.root_cluster >= 2:
+            root_cluster_offset = offset + bs.cluster_to_offset(bs.root_cluster)
+
+    fat_domain = work_dir / f"{partition_basename(partition.path)}_fat_domain.log"
+    ranges_to_recover = [
+        (offset, 512),                                  # boot sector
+        (fat_start, fat_size),                          # FAT table
+        (root_cluster_offset, state.cluster_size),      # root directory
+    ]
+    # Sort and write with gap-filling
+    ranges_to_recover.sort()
+    with open(fat_domain, 'w') as f:
+        f.write("# FAT metadata domain\n")
+        f.write("0x00000000  ?\n")
+        cursor = 0
+        for start, length in ranges_to_recover:
+            if start > cursor:
+                f.write(f"0x{cursor:08X}  0x{start - cursor:08X}  ?\n")
+            f.write(f"0x{start:08X}  0x{length:08X}  +\n")
+            cursor = start + length
+
+    cmd = ["ddrescue", "-d", "-m", str(fat_domain)] + extra + [
+           source_device, str(image_path), str(mapfile_path)]
+    _run(cmd, "Recovering FAT table and root directory")
+
+    # Step 2: Iteratively discover and recover directory clusters.
+    # Each pass reads the directories in the image, finds subdirectories
+    # whose clusters aren't recovered yet, recovers them, then repeats
+    # until the full directory tree is mapped.
+    from .mapfile.generator import generate_domain_log
+    dir_domain = work_dir / f"{partition_basename(partition.path)}_dir_domain.log"
+    all_recovered_ranges: set[tuple[int, int]] = set()
+    max_passes = 32
+
+    for pass_num in range(max_passes):
+        dir_ranges = _collect_fat_directory_ranges(
+            image_path, offset, detected, state.cluster_size,
+        )
+        # Filter to only ranges we haven't recovered yet
+        new_ranges = [r for r in dir_ranges if r not in all_recovered_ranges]
+        if not new_ranges:
+            break
+
+        all_recovered_ranges.update(new_ranges)
+        generate_domain_log(new_ranges, str(dir_domain))
+
+        cmd = ["ddrescue", "-d", "-m", str(dir_domain)] + extra + [
+               source_device, str(image_path), str(mapfile_path)]
+        _run(cmd, f"Recovering directory structure (pass {pass_num + 1}, {len(new_ranges)} regions)")
+
+
+def _collect_fat_directory_ranges(
+    image_path: Path,
+    partition_offset: int,
+    fs_type: str | None,
+    cluster_size: int,
+) -> list[tuple[int, int]]:
+    """Parse the FAT table from the image and follow all directory cluster chains.
+
+    Returns a list of (absolute_byte_offset, length) tuples covering every
+    directory's data clusters. These need to be recovered so the tree builder
+    can read subdirectory contents.
+    """
+    import mmap as _mmap
+
+    try:
+        with open(image_path, 'rb') as f:
+            mm = _mmap.mmap(f.fileno(), 0, access=_mmap.ACCESS_READ)
+    except OSError:
+        return []
+
+    ranges: list[tuple[int, int]] = []
+
+    try:
+        if fs_type == 'exfat':
+            from .exfat.boot_sector import parse_exfat_boot_sector
+            from .exfat.fat_table import ExFATTable
+            from .exfat.dir_entry import parse_directory
+
+            bs = parse_exfat_boot_sector(mm, partition_offset)
+            fat = ExFATTable(mm, bs, partition_offset)
+            _walk_exfat_dirs(mm, bs, fat, partition_offset, bs.root_cluster, ranges, set())
+        else:
+            from .fat32.boot_sector import parse_fat_boot_sector
+            from .fat32.fat_table import FATTable
+            from .fat32.dir_entry import parse_directory as parse_fat_dir, ATTR_DIRECTORY
+
+            bs = parse_fat_boot_sector(mm, partition_offset)
+            fat = FATTable(mm, bs, partition_offset)
+
+            if bs.fs_type == "FAT32":
+                _walk_fat_dirs(mm, bs, fat, partition_offset, bs.root_cluster, ranges, set())
+            else:
+                # FAT16/12: fixed root directory
+                if bs.root_entry_count > 0:
+                    root_start = partition_offset + bs.data_start - (bs.root_entry_count * 32)
+                    ranges.append((root_start, bs.root_entry_count * 32))
+                    _walk_fat16_root(mm, bs, fat, partition_offset, ranges, set())
+    except Exception as e:
+        log.warning("Could not collect directory ranges: %s", e)
+    finally:
+        mm.close()
+
+    return ranges
+
+
+def _walk_fat_dirs(mm, bs, fat, partition_offset, dir_cluster, ranges, visited, depth=0):
+    """Recursively collect byte ranges for all FAT32 directory clusters."""
+    if depth > 64 or dir_cluster < 2 or dir_cluster in visited:
+        return
+    visited.add(dir_cluster)
+
+    from .fat32.dir_entry import parse_directory, ATTR_DIRECTORY
+
+    # Add this directory's clusters to ranges
+    chain = fat.follow_chain(dir_cluster)
+    for cluster, count in chain:
+        byte_off = partition_offset + bs.cluster_to_offset(cluster)
+        ranges.append((byte_off, count * bs.cluster_size))
+
+    # Read directory data and recurse into subdirectories
+    dir_data = bytearray()
+    for cluster, count in chain:
+        byte_off = partition_offset + bs.cluster_to_offset(cluster)
+        end = byte_off + count * bs.cluster_size
+        if end <= len(mm):
+            dir_data.extend(mm[byte_off:end])
+
+    if dir_data:
+        for entry in parse_directory(bytes(dir_data)):
+            if entry.is_directory and entry.start_cluster >= 2:
+                _walk_fat_dirs(mm, bs, fat, partition_offset,
+                              entry.start_cluster, ranges, visited, depth + 1)
+
+
+def _walk_fat16_root(mm, bs, fat, partition_offset, ranges, visited):
+    """Walk FAT16 fixed root directory and recurse into subdirs."""
+    from .fat32.dir_entry import parse_directory
+
+    root_start = partition_offset + bs.data_start - (bs.root_entry_count * 32)
+    root_size = bs.root_entry_count * 32
+    if root_start + root_size > len(mm):
+        return
+    root_data = bytes(mm[root_start:root_start + root_size])
+    for entry in parse_directory(root_data):
+        if entry.is_directory and entry.start_cluster >= 2:
+            _walk_fat_dirs(mm, bs, fat, partition_offset,
+                          entry.start_cluster, ranges, visited)
+
+
+def _walk_exfat_dirs(mm, bs, fat, partition_offset, dir_cluster, ranges, visited, depth=0):
+    """Recursively collect byte ranges for all exFAT directory clusters."""
+    if depth > 64 or dir_cluster < 2 or dir_cluster in visited:
+        return
+    visited.add(dir_cluster)
+
+    from .exfat.dir_entry import parse_directory
+    import math
+
+    chain = fat.follow_chain(dir_cluster)
+    for cluster, count in chain:
+        byte_off = partition_offset + bs.cluster_to_offset(cluster)
+        ranges.append((byte_off, count * bs.cluster_size))
+
+    dir_data = bytearray()
+    for cluster, count in chain:
+        byte_off = partition_offset + bs.cluster_to_offset(cluster)
+        end = byte_off + count * bs.cluster_size
+        if end <= len(mm):
+            dir_data.extend(mm[byte_off:end])
+
+    if dir_data:
+        for entry in parse_directory(bytes(dir_data)):
+            if entry.is_directory and entry.start_cluster >= 2:
+                if entry.no_fat_chain:
+                    # Contiguous — add range directly
+                    count = math.ceil(entry.size / bs.cluster_size) if entry.size > 0 else 1
+                    byte_off = partition_offset + bs.cluster_to_offset(entry.start_cluster)
+                    ranges.append((byte_off, count * bs.cluster_size))
+                    # Still need to recurse for nested dirs
+                    # Read the dir data and parse it
+                    if byte_off + count * bs.cluster_size <= len(mm):
+                        sub_data = bytes(mm[byte_off:byte_off + count * bs.cluster_size])
+                        for sub_entry in parse_directory(sub_data):
+                            if sub_entry.is_directory and sub_entry.start_cluster >= 2:
+                                _walk_exfat_dirs(mm, bs, fat, partition_offset,
+                                                sub_entry.start_cluster, ranges, visited, depth + 1)
+                else:
+                    _walk_exfat_dirs(mm, bs, fat, partition_offset,
+                                    entry.start_cluster, ranges, visited, depth + 1)
+
+
+def _bootstrap_ext4(
+    partition: PartitionInfo,
+    source_device: str,
+    work_dir: Path,
+    state: SessionState,
+    extra: list[str],
+) -> None:
+    """Bootstrap an ext2/3/4 filesystem: recover superblock, GDT, inode tables, then dirs."""
+    image_path = Path(state.image)
+    mapfile_path = Path(state.mapfile)
+    offset = state.partition_offset
+
+    # Step 1: Recover the first 64KB of the partition (contains the superblock)
+    sb_domain = work_dir / f"{partition_basename(partition.path)}_sb_domain.log"
+    with open(sb_domain, 'w') as f:
+        f.write("# ext4 superblock domain\n")
+        f.write("0x00000000  ?\n")
+        f.write(f"0x{offset:08X}  0x{0x10000:08X}  +\n")
+    cmd = ["ddrescue", "-d", "-m", str(sb_domain)] + extra + [
+           source_device, str(image_path), str(mapfile_path)]
+    _run(cmd, "Recovering ext4 superblock")
+
+    # Step 2: Parse superblock and compute metadata ranges
+    try:
+        from .ext4.superblock import parse_superblock
+        with open(image_path, 'rb') as f:
+            # Read enough to cover the superblock
+            f.seek(offset)
+            header_data = f.read(0x10000)
+        sb = parse_superblock(header_data, partition_offset=0)
+    except Exception as e:
+        print(f"  Error parsing ext4 superblock: {e}")
+        return
+
+    state.cluster_size = sb.block_size
+    block_size = sb.block_size
+    num_groups = sb.num_groups
+
+    # GDT location and size
+    gdt_start = offset + sb.gdt_start_block * block_size
+    gdt_size = num_groups * sb.gdt_entry_size
+    # Round up to block boundary
+    gdt_size = ((gdt_size + block_size - 1) // block_size) * block_size
+
+    # Step 3: Recover GDT
+    gdt_domain = work_dir / f"{partition_basename(partition.path)}_gdt_domain.log"
+    with open(gdt_domain, 'w') as f:
+        f.write("# ext4 GDT domain\n")
+        f.write("0x00000000  ?\n")
+        f.write(f"0x{gdt_start:08X}  0x{gdt_size:08X}  +\n")
+    cmd = ["ddrescue", "-d", "-m", str(gdt_domain)] + extra + [
+           source_device, str(image_path), str(mapfile_path)]
+    _run(cmd, f"Recovering GDT ({num_groups} groups)")
+
+    # Step 4: Parse GDT and collect inode table ranges
+    try:
+        from .ext4.group_desc import parse_group_descriptors
+        with open(image_path, 'rb') as f:
+            f.seek(0)
+            full_data = f.read()
+        # parse_group_descriptors expects partition_offset relative to image
+        descriptors = parse_group_descriptors(full_data, sb, partition_offset=offset)
+    except Exception as e:
+        print(f"  Error parsing GDT: {e}")
+        return
+
+    # Inode table size per group (in blocks)
+    import math
+    inode_table_blocks = math.ceil(sb.inodes_per_group * sb.inode_size / block_size)
+    inode_table_size = inode_table_blocks * block_size
+
+    # Step 5: Recover all inode tables
+    inode_ranges = []
+    for d in descriptors:
+        if d.inode_table > 0:
+            start = offset + d.inode_table * block_size
+            inode_ranges.append((start, inode_table_size))
+
+    if inode_ranges:
+        from .mapfile.generator import generate_domain_log
+        itab_domain = work_dir / f"{partition_basename(partition.path)}_itab_domain.log"
+        generate_domain_log(inode_ranges, str(itab_domain))
+        cmd = ["ddrescue", "-d", "-m", str(itab_domain)] + extra + [
+               source_device, str(image_path), str(mapfile_path)]
+        _run(cmd, f"Recovering inode tables ({len(inode_ranges)} groups)")
+
+    # Step 6: Iteratively recover directory data blocks
+    from .mapfile.generator import generate_domain_log
+    dir_domain = work_dir / f"{partition_basename(partition.path)}_dir_domain.log"
+    all_recovered_ranges: set[tuple[int, int]] = set()
+
+    for pass_num in range(32):
+        dir_ranges = _collect_ext4_directory_ranges(
+            image_path, offset, block_size,
+        )
+        new_ranges = [r for r in dir_ranges if r not in all_recovered_ranges]
+        if not new_ranges:
+            break
+
+        all_recovered_ranges.update(new_ranges)
+        generate_domain_log(new_ranges, str(dir_domain))
+        cmd = ["ddrescue", "-d", "-m", str(dir_domain)] + extra + [
+               source_device, str(image_path), str(mapfile_path)]
+        _run(cmd, f"Recovering directory blocks (pass {pass_num + 1}, {len(new_ranges)} regions)")
+
+
+def _collect_ext4_directory_ranges(
+    image_path: Path,
+    partition_offset: int,
+    block_size: int,
+) -> list[tuple[int, int]]:
+    """Walk all directories in the ext4 filesystem and return byte ranges
+    for their data blocks (so we can recover them before the tree builder runs).
+    """
+    import mmap as _mmap
+
+    try:
+        with open(image_path, 'rb') as f:
+            mm = _mmap.mmap(f.fileno(), 0, access=_mmap.ACCESS_READ)
+    except OSError:
+        return []
+
+    ranges: list[tuple[int, int]] = []
+
+    try:
+        from .ext4.superblock import parse_superblock
+        from .ext4.group_desc import parse_group_descriptors
+        from .ext4.inode import parse_inode, inode_to_data_runs, S_IFDIR
+        from .ext4.dir_entry import parse_directory_block, FT_DIR
+
+        sb = parse_superblock(mm, partition_offset)
+        descriptors = parse_group_descriptors(mm, sb, partition_offset)
+
+        visited: set[int] = set()
+        _walk_ext4_dirs(mm, sb, descriptors, 2, partition_offset, ranges, visited)
+    except Exception as e:
+        log.warning("Could not collect ext4 directory ranges: %s", e)
+    finally:
+        mm.close()
+
+    return ranges
+
+
+def _walk_ext4_dirs(mm, sb, descriptors, inode_num, partition_offset, ranges, visited, depth=0):
+    """Recursively collect byte ranges for all ext4 directory data blocks."""
+    if depth > 64 or inode_num in visited or inode_num < 1:
+        return
+    visited.add(inode_num)
+
+    from .ext4.inode import parse_inode, inode_to_data_runs, S_IFDIR
+    from .ext4.dir_entry import parse_directory_block, FT_DIR
+
+    # Read the inode
+    group = (inode_num - 1) // sb.inodes_per_group
+    if group >= len(descriptors):
+        return
+    index_in_group = (inode_num - 1) % sb.inodes_per_group
+    inode_offset = (
+        partition_offset
+        + descriptors[group].inode_table * sb.block_size
+        + index_in_group * sb.inode_size
+    )
+    if inode_offset + sb.inode_size > len(mm):
+        return
+
+    try:
+        inode = parse_inode(bytes(mm[inode_offset:inode_offset + sb.inode_size]))
+    except Exception:
+        return
+
+    if not inode.is_directory:
+        return
+
+    # Get the directory's data blocks
+    runs = inode_to_data_runs(inode, mm, sb.block_size, partition_offset)
+    dir_data = bytearray()
+    for lcn, count in runs:
+        if lcn is None:
+            dir_data.extend(b'\x00' * count * sb.block_size)
+            continue
+        byte_off = partition_offset + lcn * sb.block_size
+        byte_len = count * sb.block_size
+        ranges.append((byte_off, byte_len))
+
+        end = byte_off + byte_len
+        if end <= len(mm):
+            dir_data.extend(mm[byte_off:end])
+
+    if inode.size > 0:
+        dir_data = dir_data[:inode.size]
+
+    # Parse entries block-by-block
+    for block_start in range(0, len(dir_data), sb.block_size):
+        block = bytes(dir_data[block_start:block_start + sb.block_size])
+        entries = parse_directory_block(block, has_filetype=sb.has_filetype)
+        for entry in entries:
+            if entry.file_type == FT_DIR or entry.file_type == 0:
+                # file_type 0 means we don't know; recurse to find out
+                _walk_ext4_dirs(mm, sb, descriptors, entry.inode,
+                               partition_offset, ranges, visited, depth + 1)
+
+
+def _bootstrap_full_partition(
+    partition: PartitionInfo,
+    source_device: str,
+    work_dir: Path,
+    state: SessionState,
+    extra: list[str],
+) -> None:
+    """Bootstrap by recovering the full partition (for ext4 and similar)."""
+    image_path = Path(state.image)
+    mapfile_path = Path(state.mapfile)
+    offset = state.partition_offset
+
+    # For ext4, metadata (superblock, group descriptors, inode tables) is
+    # distributed across block groups. Recovering just the metadata would
+    # require parsing the superblock first. For now, recover the full partition.
+    size = partition.size_bytes
+    if size <= 0:
+        # Unknown size — recover a generous 1GB chunk
+        size = 1024 * 1024 * 1024
+        print(f"  Warning: partition size unknown, recovering first {_human_size(size)}")
+
+    cmd = ["ddrescue", "-d"] + extra + [
+           source_device, str(image_path), str(mapfile_path)]
+    _run(cmd, f"Recovering partition ({_human_size(size)})")
 
 
 def _bootstrap_manual(
