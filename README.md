@@ -1,6 +1,6 @@
 # ddtriage
 
-Selective data recovery tool for Linux. Recover specific files and folders from failing drives without imaging the entire disk. Supports NTFS (including BitLocker-encrypted), FAT32, FAT16, and FAT12 filesystems, with ext4 and exFAT support planned.
+Selective data recovery tool for Linux. Recover specific files and folders from failing drives without imaging the entire disk. Supports **NTFS** (including BitLocker-encrypted), **FAT32 / FAT16 / FAT12**, **exFAT**, and **ext2 / ext3 / ext4** filesystems.
 
 > **Disclaimer:** This software is provided as-is, with no warranty of any kind. Data recovery is inherently risky -- there is no guarantee that any data can or will be recovered. The authors are not responsible for any data loss, damage, or other consequences resulting from the use or misuse of this tool. **Use at your own risk.** Always work from a copy or image when possible, and never write to a failing drive.
 
@@ -10,8 +10,8 @@ Most disk recovery tools take an all-or-nothing approach: image the entire drive
 
 ddtriage works differently:
 
-1. **Bootstrap** -- Recovers only the NTFS Master File Table (MFT) from the failing drive. The MFT is a small index (~100-200 MB) that describes every file and folder on the disk.
-2. **Browse** -- Parses the MFT and presents an interactive file browser showing the complete directory tree, file sizes, and health indicators -- all without touching the failing drive again.
+1. **Bootstrap** -- Auto-detects the filesystem and recovers only the metadata needed to index files (NTFS MFT, FAT table, or ext4 inode tables). This is typically a small fraction of the total disk.
+2. **Browse** -- Parses the metadata and presents an interactive file browser showing the complete directory tree, file sizes, and health indicators -- all without touching the failing drive again.
 3. **Select** -- You pick exactly which files and folders you need. ddtriage calculates which disk sectors contain those files.
 4. **Recover** -- Uses GNU ddrescue to surgically read only the sectors needed for your selected files, skipping everything else.
 5. **Extract** -- Reads the recovered data from the image and writes your files to an output directory, preserving the original directory structure and timestamps.
@@ -20,15 +20,17 @@ The key principle: **the failing drive is never read twice for the same sector.*
 
 ## Features
 
+- **Multi-filesystem support** -- NTFS, FAT32, FAT16, FAT12, exFAT, ext2, ext3, ext4 (auto-detected)
+- **BitLocker support** -- Transparently decrypts BitLocker-encrypted volumes via FUSE (requires password or recovery key)
 - **Selective recovery** -- Browse the full directory tree and pick individual files or folders
 - **Interactive TUI** -- ncdu-style terminal browser with health indicators, search, and keyboard navigation
-- **BitLocker support** -- Transparently decrypts BitLocker-encrypted volumes via FUSE (requires password or recovery key)
 - **Progressive imaging** -- All disk reads are cached; subsequent operations reuse existing data
 - **Health indicators** -- Per-file coverage status shows what's already in the image vs. what still needs to be read
-- **MFT coverage reporting** -- Shows what percentage of the file table was recovered, so you know if the listing is incomplete
-- **Multi-filesystem** -- NTFS, FAT32, FAT16, FAT12 (ext4 and exFAT planned)
+- **Metadata coverage reporting** -- Shows what percentage of the file table was recovered, so you know if the listing is incomplete
 - **Compressed file support** -- Handles NTFS LZNT1 compression
-- **Resilient parsing** -- Gracefully handles damaged MFT records, corrupt attributes, and partial data
+- **Extent tree support** -- Handles ext4 extents and legacy indirect block pointers
+- **Long filename support** -- Handles Windows LFN, exFAT long names, and UTF-8 Linux filenames
+- **Resilient parsing** -- Gracefully handles damaged metadata records, corrupt attributes, and partial data
 - **ddrescue tuning** -- Expose advanced ddrescue options for difficult drives (reverse, no-trim, timeout, etc.)
 
 ## Requirements
@@ -159,7 +161,7 @@ Full interactive workflow. If a device path is provided, skips disk selection. W
 
 ### `ddtriage bootstrap [device]`
 
-Recover the NTFS boot sector and MFT from the source device. Detects BitLocker encryption automatically. Creates a progressive disk image and ddrescue mapfile in the working directory.
+Auto-detect the filesystem (NTFS, FAT, exFAT, ext2/3/4, BitLocker) and recover its metadata from the source device. Creates a progressive disk image and ddrescue mapfile in the working directory.
 
 Options:
 - `--retry N` -- Number of ddrescue retry passes for bad sectors (default: 0, auto-set to 1 if errors occur)
@@ -191,7 +193,7 @@ Options:
 
 ### `ddtriage scan`
 
-Parse the MFT and report statistics (file count, directory count, orphans). No TUI, no disk I/O.
+Parse the filesystem and report statistics (file count, directory count, orphans). No TUI, no disk I/O.
 
 ### `ddtriage tree`
 
@@ -199,11 +201,11 @@ Dump the directory tree to stdout in text format.
 
 Options:
 - `--show-deleted` -- Include deleted entries
-- `--show-system` -- Include system metadata entries (MFT 0-15)
+- `--show-system` -- Include system metadata entries (e.g. NTFS MFT 0-15)
 
 ### `ddtriage info`
 
-Display NTFS boot sector information: cluster size, MFT location, volume serial number, etc.
+Display filesystem metadata: cluster/block size, MFT/inode location, volume serial number, etc. (NTFS-specific for now — other filesystems coming soon.)
 
 ### `ddtriage status`
 
@@ -300,12 +302,19 @@ Each file shows a color-coded health indicator based on how much of its data is 
 ### Architecture
 
 ```
-Phase 1: Bootstrap       -->  Recover boot sector + MFT via ddrescue
-Phase 2: MFT parse       -->  Parse MFT from image, build directory tree (no disk I/O)
+Phase 1: Bootstrap       -->  Auto-detect filesystem and recover metadata via ddrescue
+Phase 2: Parse           -->  Parse filesystem metadata from image, build directory tree (no disk I/O)
 Phase 3: TUI browser     -->  Interactive file browser with health indicators (no disk I/O)
 Phase 4: Targeted recovery -->  Generate domain log for selected files, run ddrescue (surgical disk I/O)
 Phase 5: File extraction  -->  Read file data from image, write to output directory (no disk I/O)
 ```
+
+The bootstrap phase differs by filesystem:
+
+- **NTFS** -- Recovers the boot sector and MFT region (small, contiguous). Uses `ddru_ntfsbitmap` to precisely locate the MFT when available, otherwise parses the boot sector directly.
+- **FAT32 / FAT16 / FAT12 / exFAT** -- Recovers the boot sector, FAT table, and root directory. Then iteratively recovers subdirectory clusters by following chains in the FAT until no new directories are found.
+- **ext2 / 3 / 4** -- Recovers the superblock, block group descriptors, and all inode tables (scattered across block groups). Then iteratively recovers directory data blocks by walking inode extent trees.
+- **BitLocker** -- FUSE-mounts the encrypted volume via dislocker/bdemount so all subsequent operations read decrypted data on-demand.
 
 ### Progressive disk image
 
@@ -317,19 +326,39 @@ Key properties:
 - Multiple recovery passes accumulate in the same image
 - The mapfile is the source of truth for recovery state
 
-### NTFS parsing
+### Filesystem parsers
 
-ddtriage includes a complete NTFS parser written from scratch for maximum resilience against damaged data:
+ddtriage includes filesystem parsers written from scratch, designed for maximum resilience against damaged data. No external filesystem libraries are used.
 
-- **Boot sector parser** -- Reads the NTFS BPB to find cluster size, MFT location, and record size
-- **MFT parser** -- Parses MFT records with update sequence (fixup) array validation, gracefully skipping damaged entries
-- **Attribute parser** -- Handles `$STANDARD_INFORMATION`, `$FILE_NAME`, `$DATA`, `$ATTRIBUTE_LIST`, and other NTFS attributes
-- **Data run decoder** -- Decodes the compressed LCN/VCN cluster mapping that describes where file data lives on disk
-- **Directory tree builder** -- Resolves parent references to reconstruct the full directory hierarchy, with orphan handling
-- **LZNT1 decompressor** -- Handles NTFS-compressed files
-- **Extension record merging** -- Handles `$ATTRIBUTE_LIST` for files with data spread across multiple MFT records
+**NTFS:**
+- Boot sector parser (NTFS BPB: cluster size, MFT location, record size)
+- MFT parser with update sequence (fixup) array validation
+- Attribute parser: `$STANDARD_INFORMATION`, `$FILE_NAME`, `$DATA`, `$ATTRIBUTE_LIST`, etc.
+- Data run decoder for the compressed LCN/VCN cluster mapping
+- LZNT1 decompression for compressed files
+- Extension record merging for files with data spread across multiple MFT records
 
-No external NTFS libraries are used. The parser is designed to gracefully handle missing bytes, partial records, and corrupted attributes without crashing.
+**FAT32 / FAT16 / FAT12:**
+- Boot sector (BPB) parser
+- FAT table reader supporting FAT32 (32-bit), FAT16 (16-bit), and FAT12 (12-bit, packed)
+- Directory entry parser for short (8.3) names and long filenames (LFN) via UTF-16 continuation entries
+- Cluster chain follower with run consolidation (merges consecutive clusters into data runs)
+
+**exFAT:**
+- VBR parser with shift-based sizes (bytes-per-sector-shift, sectors-per-cluster-shift)
+- 32-bit FAT table with EOC marker `0xFFFFFFFF`
+- Directory entry set parser: File entry (0x85) + Stream Extension (0xC0) + File Name (0xC1) entries
+- Handles `NoFatChain` flag for contiguous files (bypasses FAT lookup)
+
+**ext2 / ext3 / ext4:**
+- Superblock parser (located at offset 1024, magic 0xEF53)
+- Block group descriptor table (32-byte and 64-byte variants)
+- Inode parser supporting 128-byte (ext2/3) and 256-byte (ext4) layouts
+- Extent tree walker (magic 0xF30A) with recursive internal-node traversal
+- Legacy indirect block pointer fallback (12 direct + 1/2/3-indirect)
+- Variable-length directory entry parser with `file_type` field
+
+All parsers gracefully handle missing bytes, partial records, and corrupted structures without crashing.
 
 ### Targeted recovery
 
@@ -345,7 +374,7 @@ When you select files for recovery, ddtriage:
 
 ### BitLocker handling
 
-For BitLocker-encrypted drives, ddtriage uses `dislocker-fuse` to create a transparent FUSE mount that decrypts data on demand. The FUSE-mounted virtual device replaces the raw device for all ddrescue operations, so the surgical targeted recovery approach is fully preserved -- only the sectors you need are decrypted, not the entire volume.
+For BitLocker-encrypted drives, ddtriage uses `dislocker-fuse` (or `bdemount` as a fallback) to create a transparent FUSE mount that decrypts data on demand. The FUSE-mounted virtual device replaces the raw device for all ddrescue operations, so the surgical targeted recovery approach is fully preserved -- only the sectors you need are decrypted, not the entire volume.
 
 ## Files created
 
@@ -353,14 +382,19 @@ ddtriage creates files in the working directory named after the selected partiti
 
 | File | Description |
 |------|-------------|
-| `sdb1.img` | Progressive raw disk image (sparse file) |
-| `sdb1.log` | GNU ddrescue mapfile tracking recovery state |
-| `sdb1_mft_domain.log` | Domain log restricting reads to the MFT region |
+| `<part>.img` | Progressive raw disk image (sparse file) |
+| `<part>.log` | GNU ddrescue mapfile tracking recovery state |
+| `<part>_mft_domain.log` | Domain log for NTFS MFT recovery |
+| `<part>_fat_domain.log` | Domain log for FAT/exFAT metadata recovery |
+| `<part>_sb_domain.log` / `_gdt_domain.log` / `_itab_domain.log` | Domain logs for ext4 metadata recovery |
+| `<part>_dir_domain.log` | Domain log for iterative directory discovery |
 | `ddtriage_state.json` | Session state (device, offsets, settings) |
 | `selection.json` | Saved file selection for batch recovery |
 | `recovery_domain.log` | Domain log for targeted file recovery |
-| `sdb1-recovered/` | Output directory for extracted files |
-| `sdb1-recovered/recovery_report.txt` | Detailed extraction report |
+| `<part>-recovered/` | Output directory for extracted files |
+| `<part>-recovered/recovery_report.txt` | Detailed extraction report |
+
+Files are named after the selected partition (e.g. `sdb1.img`, `sdc3.img`), so recovering from multiple partitions in the same working directory doesn't clobber each other.
 
 For BitLocker volumes, additional files are created with a `_decrypted` suffix (e.g. `sdc3_decrypted.img`).
 
